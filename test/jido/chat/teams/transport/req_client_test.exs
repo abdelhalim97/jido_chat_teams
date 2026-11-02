@@ -12,7 +12,7 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
       case Process.get(:responses, []) do
         [response | rest] ->
           Process.put(:responses, rest)
-          response
+          if is_function(response, 1), do: response.(opts), else: response
 
         [] ->
           raise "FakeReq has no response"
@@ -180,6 +180,41 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
       assert request[:headers] == []
     end
 
+    test "refuses a download larger than max_media_bytes" do
+      responses([ok(200, "12345")])
+
+      assert {:error, :media_too_large} =
+               ReqClient.download_media(@download_url, credentials(max_media_bytes: 4))
+    end
+
+    test "stops reading once the download passes the limit" do
+      responses([streamed(200, ["abc", "def", "ghi"])])
+
+      assert {:error, :media_too_large} =
+               ReqClient.download_media(@download_url, credentials(max_media_bytes: 4))
+
+      assert_received {:chunk, "def"}
+      refute_received {:chunk, "ghi"}
+    end
+
+    test "stops at the first chunk when the declared size is above the limit" do
+      responses([streamed(200, ["a", "b"], %{"content-length" => ["1000"]})])
+
+      assert {:error, :media_too_large} =
+               ReqClient.download_media(@download_url, credentials(max_media_bytes: 10))
+
+      assert_received {:chunk, "a"}
+      refute_received {:chunk, "b"}
+    end
+
+    test "downloads the whole file when no limit is given" do
+      responses([ok(200, "the whole file")])
+
+      assert {:ok, "the whole file"} = ReqClient.download_media(@download_url, credentials())
+      assert_received {:request, request}
+      refute Keyword.has_key?(request, :into)
+    end
+
     for {url, reason} <- [
           {"https://bad.example/v3/attachments/1", :untrusted_media_url},
           {"http://smba.trafficmanager.net/amer/v3/attachments/1", :invalid_media_url}
@@ -193,6 +228,20 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
 
   defp credentials(extra \\ []),
     do: [req: FakeReq, app_id: "app-1", app_password: "secret"] ++ extra
+
+  defp streamed(status, chunks, headers \\ %{}) do
+    fn opts ->
+      response = %Req.Response{status: status, headers: headers, body: ""}
+
+      {_request, response} =
+        Enum.reduce_while(chunks, {nil, response}, fn chunk, acc ->
+          send(Process.get(:test_pid), {:chunk, chunk})
+          opts[:into].({:data, chunk}, acc)
+        end)
+
+      {:ok, response}
+    end
+  end
 
   defp token(status, access_token),
     do: ok(status, %{"access_token" => access_token, "expires_in" => 3600})

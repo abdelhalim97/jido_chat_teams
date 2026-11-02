@@ -64,6 +64,10 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
 
   @doc """
   Downloads media bytes coming from Teams attachments.
+
+  Teams sends no attachment size. With `:max_media_bytes`, the download stops once
+  the declared or received size passes it and returns `{:error, :media_too_large}`.
+  Without it, the whole file is downloaded.
   """
   @impl true
   def download_media(url, opts) when is_binary(url) do
@@ -97,35 +101,29 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   # Req drops the authorization header on a redirect to another host.
   defp download(url, token, opts, retry_auth?) do
     req = Keyword.get(opts, :req, Req)
+    max_bytes = max_media_bytes(opts)
 
-    request_opts = [
-      method: :get,
-      url: url,
-      headers: media_headers(token),
-      decode_body: false,
-      retry: false,
-      redirect: true,
-      redirect_trusted: false,
-      max_redirects: 3
-    ]
+    request_opts =
+      limit_download(
+        [
+          method: :get,
+          url: url,
+          headers: media_headers(token),
+          decode_body: false,
+          retry: false,
+          redirect: true,
+          redirect_trusted: false,
+          max_redirects: 3
+        ],
+        max_bytes
+      )
 
     case req.request(request_opts) do
-      {:ok, %Req.Response{status: status, body: body}}
-      when status in 200..299 and is_binary(body) ->
-        {:ok, body}
-
-      {:ok, %Req.Response{status: status}} when status in 200..299 ->
-        {:error, :invalid_media_body}
+      {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
+        media_body(response, max_bytes)
 
       {:ok, %Req.Response{status: 401}} ->
-        retry_with_new_token? = retry_auth? and is_nil(Keyword.get(opts, :access_token))
-
-        if retry_with_new_token? do
-          TokenCache.invalidate(opts)
-          download_with_token(url, opts, false)
-        else
-          {:error, {:http_error, 401}}
-        end
+        retry_unauthorized(url, opts, retry_auth?)
 
       {:ok, %Req.Response{status: 429} = response} ->
         {:error, {:rate_limited, retry_after_ms(response)}}
@@ -138,6 +136,21 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     end
   end
 
+  defp media_body(%Req.Response{body: body} = response, max_bytes) when is_binary(body) do
+    if too_large?(response, max_bytes), do: {:error, :media_too_large}, else: {:ok, body}
+  end
+
+  defp media_body(_response, _max_bytes), do: {:error, :invalid_media_body}
+
+  defp retry_unauthorized(url, opts, retry_auth?) do
+    if retry_auth? and is_nil(Keyword.get(opts, :access_token)) do
+      TokenCache.invalidate(opts)
+      download_with_token(url, opts, false)
+    else
+      {:error, {:http_error, 401}}
+    end
+  end
+
   defp download_with_token(url, opts, retry_auth?) do
     with {:ok, token} <- TokenCache.fetch(opts) do
       download(url, token, opts, retry_auth?)
@@ -146,6 +159,41 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
 
   defp media_headers(nil), do: []
   defp media_headers(token), do: [{"authorization", "Bearer #{token}"}]
+
+  defp limit_download(request_opts, nil), do: request_opts
+
+  defp limit_download(request_opts, max_bytes),
+    do: Keyword.put(request_opts, :into, &collect_media(&1, &2, max_bytes))
+
+  defp collect_media({:data, data}, {request, response}, max_bytes) do
+    response = %{response | body: response.body <> data}
+
+    if too_large?(response, max_bytes),
+      do: {:halt, {request, response}},
+      else: {:cont, {request, response}}
+  end
+
+  defp too_large?(_response, nil), do: false
+
+  defp too_large?(%Req.Response{body: body} = response, max_bytes) do
+    byte_size(body) > max_bytes or declared_size(response) > max_bytes
+  end
+
+  defp declared_size(response) do
+    with [value | _rest] <- Req.Response.get_header(response, "content-length"),
+         {size, ""} <- Integer.parse(value) do
+      size
+    else
+      _other -> 0
+    end
+  end
+
+  defp max_media_bytes(opts) do
+    case Keyword.get(opts, :max_media_bytes) do
+      max_bytes when is_integer(max_bytes) and max_bytes > 0 -> max_bytes
+      _other -> nil
+    end
+  end
 
   defp request(method, url, body, reference, opts) do
     with :ok <- validate_service_url(reference.service_url, opts),

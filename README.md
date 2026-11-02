@@ -128,6 +128,9 @@ pass `access_token: "..."` for a short test.
 - The bot token goes only to the Bot Connector hosts in `:allowed_service_hosts`.
   File downloads must use a host in `:allowed_file_hosts` (default: SharePoint).
   Other URLs return `{:error, :untrusted_media_url}` and send no request.
+- Teams sends no attachment size. Pass `:max_media_bytes` to stop a download once it
+  passes that size, with `{:error, :media_too_large}`. Without it, the whole file is
+  downloaded.
 
 ## Adaptive Cards
 
