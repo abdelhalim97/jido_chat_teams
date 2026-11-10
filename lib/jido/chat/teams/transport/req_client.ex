@@ -1,6 +1,6 @@
 defmodule Jido.Chat.Teams.Transport.ReqClient do
   @moduledoc """
-  `Req` transport for Microsoft Bot Connector activities.
+  `Req` transport for Microsoft Bot Connector activities and inbound media.
   """
 
   @behaviour Jido.Chat.Teams.Transport
@@ -14,6 +14,12 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     "smba.infra.gov.teams.microsoft.us",
     "smba.infra.dod.teams.microsoft.us"
   ]
+
+  # Hosts of the pre-authenticated `downloadUrl` of files sent in a personal chat.
+  @default_file_hosts ["sharepoint.com", "sharepoint.us", "sharepoint-mil.us"]
+
+  @media_redirect_statuses [301, 302, 303, 307, 308]
+  @max_media_redirects 3
 
   @impl true
   def send_activity(%ConversationRef{} = reference, activity, opts) do
@@ -57,6 +63,167 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
       reference,
       opts
     )
+  end
+
+  @doc """
+  Downloads media bytes coming from Teams attachments.
+
+  Teams sends no attachment size. With a positive integer in `:max_media_bytes`,
+  the download stops once the declared or received size passes it and returns
+  `{:error, :media_too_large}`. An invalid limit returns
+  `{:error, :invalid_max_media_bytes}`. Without a limit, the whole file is
+  downloaded.
+  """
+  @impl true
+  def download_media(url, opts) when is_binary(url) do
+    with {:ok, max_bytes} <- max_media_bytes(opts) do
+      download_media(url, opts, max_bytes, @max_media_redirects)
+    end
+  end
+
+  defp download_media(url, opts, max_bytes, redirects_left) do
+    case media_auth(url, opts) do
+      {:ok, :bot_token} ->
+        download_with_token(url, opts, true, max_bytes, redirects_left)
+
+      {:ok, :pre_authenticated} ->
+        download(url, nil, opts, false, max_bytes, redirects_left)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp media_auth(url, opts), do: url |> URI.parse() |> uri_auth(opts)
+
+  defp uri_auth(%URI{scheme: "https", host: host}, opts) when is_binary(host) do
+    cond do
+      trusted_host?(host, service_hosts(opts)) -> {:ok, :bot_token}
+      trusted_host?(host, file_hosts(opts)) -> {:ok, :pre_authenticated}
+      true -> {:error, :untrusted_media_url}
+    end
+  end
+
+  defp uri_auth(_uri, _opts), do: {:error, :invalid_media_url}
+
+  defp service_hosts(opts), do: Keyword.get(opts, :allowed_service_hosts, @default_service_hosts)
+  defp file_hosts(opts), do: Keyword.get(opts, :allowed_file_hosts, @default_file_hosts)
+
+  defp download(url, token, opts, retry_auth?, max_bytes, redirects_left) do
+    req = Keyword.get(opts, :req, Req)
+
+    request_opts =
+      limit_download(
+        [
+          method: :get,
+          url: url,
+          headers: media_headers(token),
+          decode_body: false,
+          retry: false,
+          redirect: false
+        ],
+        max_bytes
+      )
+
+    case req.request(request_opts) do
+      {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
+        media_body(response, max_bytes)
+
+      {:ok, %Req.Response{status: status} = response}
+      when status in @media_redirect_statuses ->
+        follow_media_redirect(response, url, opts, max_bytes, redirects_left)
+
+      {:ok, %Req.Response{status: 401}} ->
+        retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left)
+
+      {:ok, %Req.Response{status: 429} = response} ->
+        {:error, {:rate_limited, retry_after_ms(response)}}
+
+      {:ok, %Req.Response{status: status}} ->
+        {:error, {:http_error, status}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp follow_media_redirect(_response, _url, _opts, _max_bytes, 0),
+    do: {:error, :too_many_redirects}
+
+  defp follow_media_redirect(response, url, opts, max_bytes, redirects_left) do
+    with [location | _rest] when is_binary(location) and location != "" <-
+           Req.Response.get_header(response, "location"),
+         {:ok, redirect_url} <- resolve_redirect_url(url, location) do
+      download_media(redirect_url, opts, max_bytes, redirects_left - 1)
+    else
+      _other -> {:error, :invalid_media_redirect}
+    end
+  end
+
+  defp resolve_redirect_url(url, location) do
+    {:ok, url |> URI.merge(location) |> URI.to_string()}
+  rescue
+    ArgumentError -> {:error, :invalid_media_redirect}
+  end
+
+  defp media_body(%Req.Response{body: body} = response, max_bytes) when is_binary(body) do
+    if too_large?(response, max_bytes), do: {:error, :media_too_large}, else: {:ok, body}
+  end
+
+  defp media_body(_response, _max_bytes), do: {:error, :invalid_media_body}
+
+  defp retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left) do
+    if retry_auth? and is_nil(Keyword.get(opts, :access_token)) do
+      TokenCache.invalidate(opts)
+      download_with_token(url, opts, false, max_bytes, redirects_left)
+    else
+      {:error, {:http_error, 401}}
+    end
+  end
+
+  defp download_with_token(url, opts, retry_auth?, max_bytes, redirects_left) do
+    with {:ok, token} <- TokenCache.fetch(opts) do
+      download(url, token, opts, retry_auth?, max_bytes, redirects_left)
+    end
+  end
+
+  defp media_headers(nil), do: []
+  defp media_headers(token), do: [{"authorization", "Bearer #{token}"}]
+
+  defp limit_download(request_opts, nil), do: request_opts
+
+  defp limit_download(request_opts, max_bytes),
+    do: Keyword.put(request_opts, :into, &collect_media(&1, &2, max_bytes))
+
+  defp collect_media({:data, data}, {request, response}, max_bytes) do
+    response = %{response | body: response.body <> data}
+
+    if too_large?(response, max_bytes),
+      do: {:halt, {request, response}},
+      else: {:cont, {request, response}}
+  end
+
+  defp too_large?(_response, nil), do: false
+
+  defp too_large?(%Req.Response{body: body} = response, max_bytes) do
+    byte_size(body) > max_bytes or declared_size(response) > max_bytes
+  end
+
+  defp declared_size(response) do
+    with [value | _rest] <- Req.Response.get_header(response, "content-length"),
+         {size, ""} <- Integer.parse(value) do
+      size
+    else
+      _other -> 0
+    end
+  end
+
+  defp max_media_bytes(opts) do
+    case Keyword.fetch(opts, :max_media_bytes) do
+      :error -> {:ok, nil}
+      {:ok, max_bytes} when is_integer(max_bytes) and max_bytes > 0 -> {:ok, max_bytes}
+      {:ok, _other} -> {:error, :invalid_max_media_bytes}
+    end
   end
 
   defp request(method, url, body, reference, opts) do
