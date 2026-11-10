@@ -732,13 +732,14 @@ defmodule Jido.Chat.Teams.Adapter do
       conversation = value(payload, :conversation) || %{}
       from = value(payload, :from) || %{}
       activity_id = stringify(value(payload, :replyToId) || value(payload, :id))
-      channel_id = conversation |> value(:id) |> stringify()
+      thread_id = conversation |> value(:id) |> stringify()
+      channel_id = reaction_room(payload, thread_id)
 
       event =
         ReactionEvent.new(%{
           adapter: __MODULE__,
           adapter_name: :teams,
-          thread_id: channel_id,
+          thread_id: thread_id,
           channel_id: channel_id,
           message_id: activity_id,
           emoji: stringify(value(reaction, :type)),
@@ -756,7 +757,7 @@ defmodule Jido.Chat.Teams.Adapter do
          id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
          adapter_name: :teams,
          event_type: :reaction,
-         thread_id: channel_id,
+         thread_id: thread_id,
          channel_id: channel_id,
          message_id: activity_id,
          payload: event,
@@ -764,6 +765,14 @@ defmodule Jido.Chat.Teams.Adapter do
        })}
     else
       {:error, :missing_reaction}
+    end
+  end
+
+  # Matches incoming messages: in a channel the room is the channel, not its thread.
+  defp reaction_room(payload, conversation_id) do
+    case conversation_reference(payload) do
+      {:ok, %ConversationRef{} = reference} -> stringify(external_room_id(reference))
+      _error -> conversation_id
     end
   end
 
