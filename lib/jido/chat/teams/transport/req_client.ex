@@ -18,6 +18,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   # Hosts of the pre-authenticated `downloadUrl` of files sent in a personal chat.
   @default_file_hosts ["sharepoint.com", "sharepoint.us", "sharepoint-mil.us"]
 
+  @media_redirect_statuses [301, 302, 303, 307, 308]
+  @max_media_redirects 3
+
   @impl true
   def send_activity(%ConversationRef{} = reference, activity, opts) do
     request(
@@ -65,18 +68,26 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   @doc """
   Downloads media bytes coming from Teams attachments.
 
-  Teams sends no attachment size. With `:max_media_bytes`, the download stops once
-  the declared or received size passes it and returns `{:error, :media_too_large}`.
-  Without it, the whole file is downloaded.
+  Teams sends no attachment size. With a positive integer in `:max_media_bytes`,
+  the download stops once the declared or received size passes it and returns
+  `{:error, :media_too_large}`. An invalid limit returns
+  `{:error, :invalid_max_media_bytes}`. Without a limit, the whole file is
+  downloaded.
   """
   @impl true
   def download_media(url, opts) when is_binary(url) do
+    with {:ok, max_bytes} <- max_media_bytes(opts) do
+      download_media(url, opts, max_bytes, @max_media_redirects)
+    end
+  end
+
+  defp download_media(url, opts, max_bytes, redirects_left) do
     case media_auth(url, opts) do
       {:ok, :bot_token} ->
-        download_with_token(url, opts, true)
+        download_with_token(url, opts, true, max_bytes, redirects_left)
 
       {:ok, :pre_authenticated} ->
-        download(url, nil, opts, false)
+        download(url, nil, opts, false, max_bytes, redirects_left)
 
       {:error, _reason} = error ->
         error
@@ -98,10 +109,8 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   defp service_hosts(opts), do: Keyword.get(opts, :allowed_service_hosts, @default_service_hosts)
   defp file_hosts(opts), do: Keyword.get(opts, :allowed_file_hosts, @default_file_hosts)
 
-  # Req drops the authorization header on a redirect to another host.
-  defp download(url, token, opts, retry_auth?) do
+  defp download(url, token, opts, retry_auth?, max_bytes, redirects_left) do
     req = Keyword.get(opts, :req, Req)
-    max_bytes = max_media_bytes(opts)
 
     request_opts =
       limit_download(
@@ -111,9 +120,7 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
           headers: media_headers(token),
           decode_body: false,
           retry: false,
-          redirect: true,
-          redirect_trusted: false,
-          max_redirects: 3
+          redirect: false
         ],
         max_bytes
       )
@@ -122,8 +129,12 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
       {:ok, %Req.Response{status: status} = response} when status in 200..299 ->
         media_body(response, max_bytes)
 
+      {:ok, %Req.Response{status: status} = response}
+      when status in @media_redirect_statuses ->
+        follow_media_redirect(response, url, opts, max_bytes, redirects_left)
+
       {:ok, %Req.Response{status: 401}} ->
-        retry_unauthorized(url, opts, retry_auth?)
+        retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left)
 
       {:ok, %Req.Response{status: 429} = response} ->
         {:error, {:rate_limited, retry_after_ms(response)}}
@@ -136,24 +147,43 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
     end
   end
 
+  defp follow_media_redirect(_response, _url, _opts, _max_bytes, 0),
+    do: {:error, :too_many_redirects}
+
+  defp follow_media_redirect(response, url, opts, max_bytes, redirects_left) do
+    with [location | _rest] when is_binary(location) and location != "" <-
+           Req.Response.get_header(response, "location"),
+         {:ok, redirect_url} <- resolve_redirect_url(url, location) do
+      download_media(redirect_url, opts, max_bytes, redirects_left - 1)
+    else
+      _other -> {:error, :invalid_media_redirect}
+    end
+  end
+
+  defp resolve_redirect_url(url, location) do
+    {:ok, url |> URI.merge(location) |> URI.to_string()}
+  rescue
+    ArgumentError -> {:error, :invalid_media_redirect}
+  end
+
   defp media_body(%Req.Response{body: body} = response, max_bytes) when is_binary(body) do
     if too_large?(response, max_bytes), do: {:error, :media_too_large}, else: {:ok, body}
   end
 
   defp media_body(_response, _max_bytes), do: {:error, :invalid_media_body}
 
-  defp retry_unauthorized(url, opts, retry_auth?) do
+  defp retry_unauthorized(url, opts, retry_auth?, max_bytes, redirects_left) do
     if retry_auth? and is_nil(Keyword.get(opts, :access_token)) do
       TokenCache.invalidate(opts)
-      download_with_token(url, opts, false)
+      download_with_token(url, opts, false, max_bytes, redirects_left)
     else
       {:error, {:http_error, 401}}
     end
   end
 
-  defp download_with_token(url, opts, retry_auth?) do
+  defp download_with_token(url, opts, retry_auth?, max_bytes, redirects_left) do
     with {:ok, token} <- TokenCache.fetch(opts) do
-      download(url, token, opts, retry_auth?)
+      download(url, token, opts, retry_auth?, max_bytes, redirects_left)
     end
   end
 
@@ -189,9 +219,10 @@ defmodule Jido.Chat.Teams.Transport.ReqClient do
   end
 
   defp max_media_bytes(opts) do
-    case Keyword.get(opts, :max_media_bytes) do
-      max_bytes when is_integer(max_bytes) and max_bytes > 0 -> max_bytes
-      _other -> nil
+    case Keyword.fetch(opts, :max_media_bytes) do
+      :error -> {:ok, nil}
+      {:ok, max_bytes} when is_integer(max_bytes) and max_bytes > 0 -> {:ok, max_bytes}
+      {:ok, _other} -> {:error, :invalid_max_media_bytes}
     end
   end
 

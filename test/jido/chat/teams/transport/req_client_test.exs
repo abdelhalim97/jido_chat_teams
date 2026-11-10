@@ -123,7 +123,7 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
       assert request[:url] == @image_url
       assert {"authorization", "Bearer token-1"} in request[:headers]
       assert request[:decode_body] == false
-      assert request[:redirect_trusted] == false
+      assert request[:redirect] == false
     end
 
     test "gets a new token once after a 401" do
@@ -180,6 +180,62 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
       assert request[:headers] == []
     end
 
+    test "follows a redirect after it validates the destination" do
+      redirect_url = "https://contoso-my.sharepoint.com/personal/ada/download?tempauth=y"
+
+      responses([
+        ok(302, "", %{"location" => [redirect_url]}),
+        ok(200, "redirected-bytes")
+      ])
+
+      assert {:ok, "redirected-bytes"} = ReqClient.download_media(@download_url, credentials())
+
+      assert_received {:request, first_request}
+      assert first_request[:url] == @download_url
+      assert first_request[:redirect] == false
+
+      assert_received {:request, second_request}
+      assert second_request[:url] == redirect_url
+      assert second_request[:headers] == []
+    end
+
+    test "does not follow a redirect to an untrusted host" do
+      responses([ok(302, "", %{"location" => ["https://untrusted.example/download"]})])
+
+      assert {:error, :untrusted_media_url} =
+               ReqClient.download_media(@download_url, credentials())
+
+      assert_received {:request, request}
+      assert request[:url] == @download_url
+      refute_received {:request, _request}
+    end
+
+    test "does not send a bot token to an untrusted redirect host" do
+      responses([
+        token(200, "token-1"),
+        ok(302, "", %{"location" => ["https://untrusted.example/download"]})
+      ])
+
+      assert {:error, :untrusted_media_url} = ReqClient.download_media(@image_url, credentials())
+
+      assert_received {:request, _token_request}
+      assert_received {:request, request}
+      assert {"authorization", "Bearer token-1"} in request[:headers]
+      refute_received {:request, _request}
+    end
+
+    test "stops after three redirects" do
+      responses([
+        redirect(@download_url, 1),
+        redirect(@download_url, 2),
+        redirect(@download_url, 3),
+        redirect(@download_url, 4)
+      ])
+
+      assert {:error, :too_many_redirects} =
+               ReqClient.download_media(@download_url, credentials())
+    end
+
     test "refuses a download larger than max_media_bytes" do
       responses([ok(200, "12345")])
 
@@ -215,6 +271,18 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
       refute Keyword.has_key?(request, :into)
     end
 
+    for invalid_limit <- [0, -1, "4"] do
+      test "rejects invalid max_media_bytes value #{inspect(invalid_limit)}" do
+        assert {:error, :invalid_max_media_bytes} =
+                 ReqClient.download_media(
+                   @download_url,
+                   credentials(max_media_bytes: unquote(invalid_limit))
+                 )
+
+        refute_received {:request, _request}
+      end
+    end
+
     for {url, reason} <- [
           {"https://bad.example/v3/attachments/1", :untrusted_media_url},
           {"http://smba.trafficmanager.net/amer/v3/attachments/1", :invalid_media_url}
@@ -246,6 +314,9 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
   defp token(status, access_token),
     do: ok(status, %{"access_token" => access_token, "expires_in" => 3600})
 
+  defp redirect(url, number),
+    do: ok(302, "", %{"location" => [url <> "&redirect=#{number}"]})
+
   defp reference do
     ConversationRef.new(%{
       conversation_id: "19:thread@thread.tacv2",
@@ -254,5 +325,8 @@ defmodule Jido.Chat.Teams.Transport.ReqClientTest do
   end
 
   defp responses(values), do: Process.put(:responses, values)
-  defp ok(status, body), do: {:ok, %Req.Response{status: status, headers: %{}, body: body}}
+  defp ok(status, body), do: ok(status, body, %{})
+
+  defp ok(status, body, headers),
+    do: {:ok, %Req.Response{status: status, headers: headers, body: body}}
 end
