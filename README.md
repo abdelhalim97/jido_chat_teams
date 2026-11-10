@@ -107,6 +107,19 @@ credentials = %{
 The token cache gets a Bot Connector access token when it is necessary. You can
 pass `access_token: "..."` for a short test.
 
+A single-tenant bot also needs its Microsoft Entra tenant. Add `app_tenant_id`
+with the tenant GUID or domain, such as `contoso.onmicrosoft.com`. The adapter then
+gets tokens from that tenant's endpoint. Without `app_tenant_id`, it uses the
+multi-tenant `botframework.com` endpoint. An explicit `token_url` overrides both.
+
+```elixir
+opts = [
+  app_id: System.fetch_env!("MICROSOFT_APP_ID"),
+  app_password: System.fetch_env!("MICROSOFT_APP_PASSWORD"),
+  app_tenant_id: System.fetch_env!("MICROSOFT_APP_TENANT_ID")
+]
+```
+
 ## Receive attachments
 
 `Incoming.media` lists the attachments of an inbound message. Download one with
@@ -128,9 +141,9 @@ pass `access_token: "..."` for a short test.
 - The bot token goes only to the Bot Connector hosts in `:allowed_service_hosts`.
   File downloads must use a host in `:allowed_file_hosts` (default: SharePoint).
   Other URLs return `{:error, :untrusted_media_url}` and send no request.
-- Teams sends no attachment size. Pass `:max_media_bytes` to stop a download once it
-  passes that size, with `{:error, :media_too_large}`. Without it, the whole file is
-  downloaded.
+- Teams sends no attachment size. Pass a positive integer in `:max_media_bytes` to
+  stop a download once it passes that size, with `{:error, :media_too_large}`.
+  Without it, the whole file is downloaded.
 
 ## Adaptive Cards
 
@@ -237,7 +250,8 @@ TEAMS_TEST_CONVERSATION_REF=teamsref:v1:...
 TEAMS_TEST_REPLY_TO_ID=...
 ```
 
-`TEAMS_TEST_REPLY_TO_ID` is optional. Run the live suite with this command:
+`TEAMS_TEST_REPLY_TO_ID` is optional. Set `MICROSOFT_APP_TENANT_ID` too when the
+test bot is single-tenant. Run the live suite with this command:
 
 ```shell
 mix test --include live test/jido/chat/team/live_integration_test.exs

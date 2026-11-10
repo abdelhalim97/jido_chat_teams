@@ -261,6 +261,39 @@ defmodule Jido.Chat.Teams.AdapterTest do
     assert %ReactionEvent{emoji: "like", added: true, message_id: "activity-1"} =
              reaction_envelope.payload
 
+    channel_reaction = %{
+      "type" => "messageReaction",
+      "id" => "reaction-2",
+      "replyToId" => "1575667808184",
+      "serviceUrl" => "https://smba.trafficmanager.net/amer/",
+      "conversation" => %{
+        "conversationType" => "channel",
+        "id" => "19:channel@thread.tacv2;messageid=1575667800000"
+      },
+      "channelData" => %{
+        "channel" => %{"id" => "19:channel@thread.tacv2"},
+        "team" => %{"id" => "19:team@thread.tacv2"},
+        "tenant" => %{"id" => "tenant-1"}
+      },
+      "from" => %{"id" => "29:user", "aadObjectId" => "aad-user-1"},
+      "reactionsAdded" => [%{"type" => "heart"}]
+    }
+
+    assert {:ok, channel_envelope} =
+             Jido.Chat.Teams.Adapter.parse_event(
+               WebhookRequest.new(%{adapter_name: :teams, payload: channel_reaction})
+             )
+
+    assert %{channel_id: "19:channel@thread.tacv2", message_id: "1575667808184"} =
+             channel_envelope
+
+    assert %ReactionEvent{
+             channel_id: "19:channel@thread.tacv2",
+             thread_id: "19:channel@thread.tacv2;messageid=1575667800000",
+             emoji: "heart",
+             user: %{user_id: "aad-user-1"}
+           } = channel_envelope.payload
+
     invoke_request =
       WebhookRequest.new(%{
         adapter_name: :teams,
