@@ -14,6 +14,9 @@ defmodule Jido.Chat.Teams.Adapter do
     EventEnvelope,
     Incoming,
     Media,
+    Message,
+    MessageDeletedEvent,
+    MessageUpdatedEvent,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
@@ -30,6 +33,11 @@ defmodule Jido.Chat.Teams.Adapter do
 
   @card_content_type "application/vnd.microsoft.card.adaptive"
   @default_options_timeout_ms 3_000
+  @message_event_types %{
+    "message" => :message,
+    "messageUpdate" => :message_updated,
+    "messageDelete" => :message_deleted
+  }
   @media_type_pattern ~r/^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/
   @media_kind_extensions %{
     ".aac" => :audio,
@@ -324,21 +332,8 @@ defmodule Jido.Chat.Teams.Adapter do
     payload = request.payload
 
     case {value(payload, :type), value(payload, :name)} do
-      {type, _name} when type in ["message", "messageUpdate", "messageDelete"] ->
-        with {:ok, incoming} <- transform_incoming(payload) do
-          {:ok,
-           EventEnvelope.new(%{
-             id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
-             adapter_name: :teams,
-             event_type: :message,
-             thread_id: incoming.external_thread_id,
-             channel_id: stringify(incoming.external_room_id),
-             message_id: stringify(incoming.external_message_id),
-             payload: incoming,
-             raw: normalize_struct(payload),
-             metadata: %{activity_type: type}
-           })}
-        end
+      {type, _name} when is_map_key(@message_event_types, type) ->
+        parse_message_event(payload, Map.fetch!(@message_event_types, type))
 
       {"messageReaction", _name} ->
         parse_reaction_event(payload)
@@ -759,6 +754,55 @@ defmodule Jido.Chat.Teams.Adapter do
     do: if(String.trim(value) == "", do: nil, else: value)
 
   defp blank_to_nil(_value), do: nil
+
+  defp parse_message_event(payload, event_type) do
+    with {:ok, incoming} <- transform_incoming(payload) do
+      {:ok,
+       EventEnvelope.new(%{
+         id: stringify(value(payload, :id)) || Jido.Chat.ID.generate!(),
+         adapter_name: :teams,
+         event_type: event_type,
+         thread_id: incoming.external_thread_id,
+         channel_id: stringify(incoming.external_room_id),
+         message_id: stringify(incoming.external_message_id),
+         payload: message_event_payload(event_type, incoming, payload),
+         raw: normalize_struct(payload),
+         metadata: %{activity_type: value(payload, :type)}
+       })}
+    end
+  end
+
+  defp message_event_payload(:message, incoming, _payload), do: incoming
+
+  defp message_event_payload(:message_updated, incoming, payload) do
+    incoming
+    |> lifecycle_attrs(payload)
+    |> Map.put(:message, Message.from_incoming(incoming, adapter_name: :teams))
+    |> MessageUpdatedEvent.new()
+  end
+
+  defp message_event_payload(:message_deleted, incoming, payload) do
+    incoming
+    |> lifecycle_attrs(payload)
+    |> MessageDeletedEvent.new()
+  end
+
+  defp lifecycle_attrs(incoming, payload) do
+    %{
+      adapter: __MODULE__,
+      adapter_name: :teams,
+      thread_id: incoming.external_thread_id,
+      channel_id: stringify(incoming.external_room_id),
+      message_id: incoming.external_message_id,
+      author: incoming.author,
+      timestamp: incoming.timestamp,
+      raw: normalize_struct(payload),
+      metadata: %{
+        event_type: value(value(payload, :channelData) || %{}, :eventType),
+        channel_meta: incoming.channel_meta
+      }
+    }
+  end
 
   defp parse_reaction_event(payload) do
     added = value(payload, :reactionsAdded) |> List.wrap()

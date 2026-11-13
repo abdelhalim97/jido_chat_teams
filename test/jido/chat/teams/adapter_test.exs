@@ -3,7 +3,10 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
   alias Jido.Chat.{
     ActionEvent,
+    Incoming,
     Media,
+    MessageDeletedEvent,
+    MessageUpdatedEvent,
     OptionsLoadError,
     OptionsLoadEvent,
     OptionsLoadResult,
@@ -311,6 +314,65 @@ defmodule Jido.Chat.Teams.AdapterTest do
     assert %ActionEvent{action_id: "approve", value: "42"} = action_envelope.payload
   end
 
+  test "parses a new message into a message event" do
+    assert {:ok, envelope} = parse_activity(channel_activity())
+
+    assert %{event_type: :message, channel_id: "channel-1", message_id: "activity-1"} = envelope
+    assert %Incoming{text: "hello from Teams"} = envelope.payload
+  end
+
+  test "parses edited and restored messages into message-updated events" do
+    for event_type <- ["editMessage", "undeleteMessage"] do
+      activity =
+        channel_activity()
+        |> Map.put("type", "messageUpdate")
+        |> Map.put("text", "<at>Jido</at> hello again")
+        |> put_in(["channelData", "eventType"], event_type)
+
+      assert {:ok, envelope} = parse_activity(activity)
+
+      assert %{
+               event_type: :message_updated,
+               channel_id: "channel-1",
+               thread_id: "19:thread@thread.tacv2",
+               message_id: "activity-1"
+             } = envelope
+
+      assert %MessageUpdatedEvent{
+               adapter_name: :teams,
+               channel_id: "channel-1",
+               thread_id: "19:thread@thread.tacv2",
+               message_id: "activity-1",
+               author: %{user_id: "aad-user-1"},
+               timestamp: "2026-08-19T12:00:00Z",
+               message: %{text: "hello again", external_message_id: "activity-1"},
+               metadata: %{event_type: ^event_type}
+             } = envelope.payload
+    end
+  end
+
+  test "parses a deleted message into a message-deleted event without content" do
+    activity =
+      channel_activity()
+      |> Map.put("type", "messageDelete")
+      |> Map.delete("text")
+      |> Map.delete("entities")
+      |> put_in(["channelData", "eventType"], "softDeleteMessage")
+
+    assert {:ok, envelope} = parse_activity(activity)
+
+    assert %{event_type: :message_deleted, channel_id: "channel-1", message_id: "activity-1"} =
+             envelope
+
+    assert %MessageDeletedEvent{
+             channel_id: "channel-1",
+             message_id: "activity-1",
+             author: %{user_id: "aad-user-1"},
+             message: nil,
+             metadata: %{event_type: "softDeleteMessage"}
+           } = envelope.payload
+  end
+
   test "parses Teams dynamic-search invokes into normalized options-load events" do
     request =
       WebhookRequest.new(%{
@@ -585,6 +647,12 @@ defmodule Jido.Chat.Teams.AdapterTest do
     |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
     |> Map.put("channelData", %{"tenant" => %{"id" => "tenant-1"}})
     |> Map.put("attachments", attachments)
+  end
+
+  defp parse_activity(activity) do
+    Jido.Chat.Teams.Adapter.parse_event(
+      WebhookRequest.new(%{adapter_name: :teams, payload: activity})
+    )
   end
 
   defp channel_activity do

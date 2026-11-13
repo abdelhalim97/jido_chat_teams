@@ -21,6 +21,8 @@ The spike includes these functions:
 - Render canonical date, number, and dynamic-select modal inputs for Teams dialogs.
 - Normalize Teams dynamic-search invokes and responses.
 - Parse message reaction and Adaptive Card invoke activities.
+- Parse message edits and restores as `:message_updated` events and deletions as
+  `:message_deleted` events.
 - Run deterministic protocol and security tests with no Microsoft account.
 - Run an optional live suite after you add credentials and a conversation reference.
 
