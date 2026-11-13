@@ -11,6 +11,7 @@ defmodule Jido.Chat.Teams.Adapter do
   alias Jido.Chat.{
     ActionEvent,
     ChannelInfo,
+    ChannelRef,
     EventEnvelope,
     Incoming,
     Media,
@@ -23,6 +24,7 @@ defmodule Jido.Chat.Teams.Adapter do
     PostPayload,
     ReactionEvent,
     Response,
+    Thread,
     WebhookRequest,
     WebhookResponse
   }
@@ -775,9 +777,15 @@ defmodule Jido.Chat.Teams.Adapter do
   defp message_event_payload(:message, incoming, _payload), do: incoming
 
   defp message_event_payload(:message_updated, incoming, payload) do
+    message =
+      Message.from_incoming(incoming,
+        adapter_name: :teams,
+        thread_id: lifecycle_thread_id(incoming)
+      )
+
     incoming
     |> lifecycle_attrs(payload)
-    |> Map.put(:message, Message.from_incoming(incoming, adapter_name: :teams))
+    |> Map.put(:message, message)
     |> MessageUpdatedEvent.new()
   end
 
@@ -788,11 +796,33 @@ defmodule Jido.Chat.Teams.Adapter do
   end
 
   defp lifecycle_attrs(incoming, payload) do
+    room_id = incoming.external_room_id
+    thread_id = lifecycle_thread_id(incoming)
+
     %{
       adapter: __MODULE__,
       adapter_name: :teams,
-      thread_id: incoming.external_thread_id,
-      channel_id: stringify(incoming.external_room_id),
+      thread_id: thread_id,
+      channel_id: stringify(room_id),
+      thread:
+        Thread.new(%{
+          id: thread_id,
+          adapter_name: :teams,
+          adapter: __MODULE__,
+          external_room_id: room_id,
+          external_thread_id: incoming.external_thread_id,
+          channel_id: "teams:#{room_id}",
+          is_dm: incoming.channel_meta.is_dm,
+          metadata: %{delivery_external_room_id: incoming.delivery_external_room_id}
+        }),
+      channel:
+        ChannelRef.new(%{
+          id: "teams:#{room_id}",
+          adapter_name: :teams,
+          adapter: __MODULE__,
+          external_id: room_id,
+          metadata: %{is_dm: incoming.channel_meta.is_dm}
+        }),
       message_id: incoming.external_message_id,
       author: incoming.author,
       timestamp: incoming.timestamp,
@@ -803,6 +833,11 @@ defmodule Jido.Chat.Teams.Adapter do
       }
     }
   end
+
+  defp lifecycle_thread_id(%Incoming{external_thread_id: nil, external_room_id: room_id}),
+    do: "teams:#{room_id}"
+
+  defp lifecycle_thread_id(%Incoming{external_thread_id: thread_id}), do: thread_id
 
   defp parse_reaction_event(payload) do
     added = value(payload, :reactionsAdded) |> List.wrap()

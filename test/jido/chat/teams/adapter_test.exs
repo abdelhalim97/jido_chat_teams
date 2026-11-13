@@ -3,6 +3,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
   alias Jido.Chat.{
     ActionEvent,
+    ChannelRef,
     Incoming,
     Media,
     MessageDeletedEvent,
@@ -12,6 +13,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
     OptionsLoadResult,
     PostPayload,
     ReactionEvent,
+    Thread,
     WebhookRequest
   }
 
@@ -371,6 +373,69 @@ defmodule Jido.Chat.Teams.AdapterTest do
              message: nil,
              metadata: %{event_type: "softDeleteMessage"}
            } = envelope.payload
+  end
+
+  test "gives lifecycle handlers the thread and channel of the message" do
+    chat =
+      Jido.Chat.new(adapters: %{teams: Jido.Chat.Teams.Adapter})
+      |> Jido.Chat.on_message_updated(&send(self(), {:lifecycle, &1}))
+      |> Jido.Chat.on_message_deleted(&send(self(), {:lifecycle, &1}))
+
+    channel_edit =
+      channel_activity()
+      |> Map.put("type", "messageUpdate")
+      |> put_in(["channelData", "eventType"], "editMessage")
+
+    personal_delete =
+      channel_activity()
+      |> Map.put("type", "messageDelete")
+      |> Map.put("conversation", %{"id" => "personal-1", "conversationType" => "personal"})
+      |> Map.put("channelData", %{
+        "tenant" => %{"id" => "tenant-1"},
+        "eventType" => "softDeleteMessage"
+      })
+      |> Map.delete("text")
+      |> Map.delete("entities")
+
+    for activity <- [channel_edit, personal_delete] do
+      assert {:ok, envelope} = parse_activity(activity)
+      assert {:ok, _chat, _event} = Jido.Chat.process_event(chat, :teams, envelope, [])
+    end
+
+    assert_received {:lifecycle, %MessageUpdatedEvent{} = edited}
+    assert edited.thread_id == "19:thread@thread.tacv2"
+    assert edited.message.thread_id == edited.thread_id
+
+    assert %Thread{
+             id: "19:thread@thread.tacv2",
+             external_room_id: "channel-1",
+             external_thread_id: "19:thread@thread.tacv2",
+             adapter: Jido.Chat.Teams.Adapter,
+             is_dm: false,
+             metadata: %{delivery_external_room_id: "teamsref:v1:" <> _}
+           } = edited.thread
+
+    assert %ChannelRef{
+             id: "teams:channel-1",
+             external_id: "channel-1",
+             metadata: %{is_dm: false}
+           } = edited.channel
+
+    assert_received {:lifecycle, %MessageDeletedEvent{} = deleted}
+    assert deleted.thread_id == "teams:personal-1"
+
+    assert %Thread{
+             id: "teams:personal-1",
+             external_room_id: "personal-1",
+             external_thread_id: nil,
+             is_dm: true
+           } = deleted.thread
+
+    assert %ChannelRef{
+             id: "teams:personal-1",
+             external_id: "personal-1",
+             metadata: %{is_dm: true}
+           } = deleted.channel
   end
 
   test "parses Teams dynamic-search invokes into normalized options-load events" do
