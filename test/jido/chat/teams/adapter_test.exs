@@ -49,8 +49,13 @@ defmodule Jido.Chat.Teams.AdapterTest do
     @impl true
     def download_media(url, opts) do
       send(opts[:test_pid], {:download_media, url})
+      send(opts[:test_pid], {:download_limit, opts[:max_media_bytes]})
       {:ok, "media-bytes"}
     end
+  end
+
+  defmodule TokenReq do
+    def request(_opts), do: Process.get(:token_response)
   end
 
   defmodule NoMediaTransport do
@@ -169,6 +174,46 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
     assert misleading.kind == :file
     assert misleading.media_type == "application/pdf"
+  end
+
+  describe "verify_credentials/1" do
+    @credentials [
+      req: TokenReq,
+      app_id: "app-1",
+      app_password: "secret",
+      app_tenant_id: "tenant-1"
+    ]
+
+    test "accepts credentials that obtain a token" do
+      Process.put(
+        :token_response,
+        {:ok, %Req.Response{status: 200, body: %{"access_token" => "token-1"}}}
+      )
+
+      assert :ok = Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
+    end
+
+    test "returns Microsoft's description of rejected credentials" do
+      Process.put(
+        :token_response,
+        {:ok,
+         %Req.Response{
+           status: 401,
+           body: %{
+             "error" => "invalid_client",
+             "error_description" => "AADSTS7000215: Invalid client secret"
+           }
+         }}
+      )
+
+      assert {:error, "AADSTS7000215: Invalid client secret"} =
+               Jido.Chat.Teams.Adapter.verify_credentials(@credentials)
+    end
+
+    test "reports a missing credential" do
+      assert {:error, {:missing_credential, :app_id}} =
+               Jido.Chat.Teams.Adapter.verify_credentials(req: TokenReq, app_password: "secret")
+    end
   end
 
   test "rejects unsupported activity types" do
@@ -660,6 +705,17 @@ defmodule Jido.Chat.Teams.AdapterTest do
                Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
 
       assert_received {:download_media, @image_url}
+    end
+
+    test "passes the byte limit of a bounded fetch to the transport" do
+      assert {:ok, "media-bytes"} =
+               Jido.Chat.Teams.Adapter.fetch_bounded_media(@image_url, 1_024, media_opts())
+
+      assert_received {:download_media, @image_url}
+      assert_received {:download_limit, 1_024}
+
+      assert {:ok, "media-bytes"} = Jido.Chat.Teams.Adapter.fetch_media(@image_url, media_opts())
+      assert_received {:download_limit, nil}
     end
 
     test "prefers the downloadUrl of a Media struct or a string-keyed map" do

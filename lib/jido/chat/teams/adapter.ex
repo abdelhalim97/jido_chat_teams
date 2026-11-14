@@ -29,7 +29,7 @@ defmodule Jido.Chat.Teams.Adapter do
     WebhookResponse
   }
 
-  alias Jido.Chat.Teams.{CardRenderer, ConversationRef}
+  alias Jido.Chat.Teams.{Auth, CardRenderer, ConversationRef}
   alias Jido.Chat.Teams.Auth.JwtVerifier
   alias Jido.Chat.Teams.Transport.ReqClient
 
@@ -195,6 +195,24 @@ defmodule Jido.Chat.Teams.Adapter do
 
   def transform_incoming(_payload), do: {:error, :invalid_activity}
 
+  @doc """
+  Checks the bot credentials by requesting a Bot Connector token, without sending
+  an activity. Returns Microsoft's `error_description` when it rejects them.
+  """
+  @spec verify_credentials(keyword()) :: :ok | {:error, term()}
+  def verify_credentials(opts \\ []) do
+    case Auth.fetch_token(opts) do
+      {:ok, _token} ->
+        :ok
+
+      {:error, {:oauth_error, _status, %{"error_description" => description}}} ->
+        {:error, description}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   @impl true
   def send_message(external_room_id, text, opts \\ []) when is_binary(text) do
     with {:ok, reference} <- ConversationRef.cast(external_room_id, opts),
@@ -306,6 +324,16 @@ defmodule Jido.Chat.Teams.Adapter do
       {:error, _reason} = error -> error
     end
   end
+
+  @doc """
+  Downloads an inbound attachment but stops once it exceeds `max_bytes`, with
+  `{:error, :media_too_large}`. Teams sends no attachment size, so a caller
+  cannot check the size before downloading.
+  """
+  @spec fetch_bounded_media(term(), pos_integer(), keyword()) ::
+          {:ok, binary()} | {:error, term()}
+  def fetch_bounded_media(reference, max_bytes, opts \\ []),
+    do: fetch_media(reference, Keyword.put(opts, :max_media_bytes, max_bytes))
 
   @impl true
   def load_options(%OptionsLoadEvent{} = event, opts \\ []) do
