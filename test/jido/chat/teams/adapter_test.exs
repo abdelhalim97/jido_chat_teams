@@ -559,7 +559,7 @@ defmodule Jido.Chat.Teams.AdapterTest do
   end
 
   test "normalizes missing loaders, groups, loader errors, and timeouts" do
-    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 20})
+    event = OptionsLoadEvent.new(%{action_id: "assignee", timeout_ms: 500})
 
     assert {:error, %OptionsLoadError{code: "options_loader_unavailable"}} =
              Jido.Chat.Teams.Adapter.load_options(event)
@@ -590,7 +590,8 @@ defmodule Jido.Chat.Teams.AdapterTest do
 
     assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
              Jido.Chat.Teams.Adapter.load_options(event,
-               options_loader: explicit_timeout_loader
+               options_loader: explicit_timeout_loader,
+               timeout_ms: 20
              )
 
     timeout_loader = fn _event, _opts ->
@@ -599,7 +600,10 @@ defmodule Jido.Chat.Teams.AdapterTest do
     end
 
     assert {:error, %OptionsLoadError{kind: :timeout, timeout_ms: 20}} =
-             Jido.Chat.Teams.Adapter.load_options(event, options_loader: timeout_loader)
+             Jido.Chat.Teams.Adapter.load_options(event,
+               options_loader: timeout_loader,
+               timeout_ms: 20
+             )
   end
 
   test "uses standard, adapter, event, and default options timeout precedence" do
